@@ -25,5 +25,11 @@ frontend/dist/
 *.log
 bin/
 
+# Local user data written at runtime — never publish these.
+# settings.json holds the download directory and cookie file path;
+# history.json holds the titles and URLs of everything downloaded.
+/settings.json
+/history.json
+
 # Local Claude Code guidance — keep out of the public repo
 CLAUDE.md
