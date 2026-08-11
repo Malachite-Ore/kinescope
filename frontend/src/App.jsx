@@ -171,7 +171,11 @@ const parseTemplateToBlocks = (tpl, nextId) => {
   return blocks;
 };
 
-const COOKIE_BROWSERS = ['chrome', 'firefox', 'edge', 'brave', 'opera', 'chromium', 'safari'];
+// Every browser yt-dlp can read a cookie store from. The backend reports which of
+// these actually exist on this machine; the rest stay selectable as a manual override.
+const COOKIE_BROWSERS = ['chrome', 'firefox', 'edge', 'brave', 'safari', 'vivaldi', 'opera', 'chromium', 'whale'];
+
+const browserLabel = (b) => (b ? b.charAt(0).toUpperCase() + b.slice(1) : '');
 
 // Cheap heuristic so a playlist URL routes to the browser instead of a single scan.
 const looksLikePlaylist = (s) =>
@@ -227,9 +231,13 @@ export default function App() {
   const [clipboardSuggestion, setClipboardSuggestion] = useState('');
   const [filenameTemplate,   setFilenameTemplate]   = useState('%(title)s.%(ext)s');
   const [filenamePreset,     setFilenamePreset]     = useState('%(title)s.%(ext)s');
-  const [cookiesMode,        setCookiesMode]        = useState('none'); // 'none'|'browser'|'file'
-  const [cookiesBrowser,     setCookiesBrowser]     = useState('chrome');
+  // Authentication is armed by default — a cookie store that can't be read falls
+  // back to a signed-out attempt in the backend, so leaving it on costs nothing.
+  const [cookiesMode,        setCookiesMode]        = useState('browser'); // 'none'|'browser'|'file'
+  const [cookiesBrowser,     setCookiesBrowser]     = useState('auto');
   const [cookiesFile,        setCookiesFile]        = useState('');
+  const [detectedBrowsers,   setDetectedBrowsers]   = useState(null);  // null until probed
+  const [authNotice,         setAuthNotice]         = useState('');    // signed-out fallback message
   const [activeHelp,         setActiveHelp]         = useState(null); // null | 'filename' | 'auth' | 'codec'
   const [videoCodec,         setVideoCodec]         = useState('h264'); // h264 | h265 | av1 | any
   const [filenameBlocks,     setFilenameBlocks]     = useState([]);   // working blocks while builder is open
@@ -275,7 +283,9 @@ export default function App() {
     setClipStart('');
     setClipEnd('');
     setOptionsOpen(false);
-    setCookiesMode('none');
+    setAuthNotice('');
+    // Authentication is deliberately not reset — it's a machine-level preference,
+    // not a per-transmission one, and re-arming it every time defeats the point.
   };
 
   // Mount: initialize, load settings + history
@@ -297,17 +307,22 @@ export default function App() {
             );
             setFilenamePreset(match ? settings.filename_template : '__custom__');
           }
+          if (settings.cookies_mode)    setCookiesMode(settings.cookies_mode);
           if (settings.cookies_browser) setCookiesBrowser(settings.cookies_browser);
           if (settings.cookies_file)    setCookiesFile(settings.cookies_file);
           if (settings.video_codec)     setVideoCodec(settings.video_codec);
           window.pywebview.api.check_ytdlp_update()
             .then((info) => setYtdlpUpdateInfo(info))
             .catch(() => {});
+          window.pywebview.api.detect_browsers()
+            .then((res) => setDetectedBrowsers(res?.browsers || []))
+            .catch(() => setDetectedBrowsers([]));
         } catch (err) {
           setError('Failed to initialize: ' + err.message);
         }
       } else {
         setDownloadDir('C:\\Users\\MockUser\\Downloads');
+        setDetectedBrowsers(['chrome', 'firefox']);
         setHistory([
           { title: 'Night Drive // Long Take', uploader: 'Neon Archive', formatNote: '1080p FHD', dir: 'C:\\Users\\MockUser\\Downloads', time: 1719400000 },
         ]);
@@ -326,6 +341,10 @@ export default function App() {
   // and falls back to the legacy single-download path for untagged events.
   useEffect(() => {
     window.onDownloadProgress = (data) => {
+      // A job that couldn't read the cookie store still ran — say so rather than
+      // letting the user think the file came down authenticated.
+      if (data.cookie_warning) setAuthNotice(data.cookie_warning);
+
       const handler = data.job_id && jobHandlersRef.current[data.job_id];
       if (handler) {
         handler(data);
@@ -370,7 +389,9 @@ export default function App() {
       setVideoInfo(null);
       setPlaylist(null);
     }
-  }, [url]);
+    // Authentication is part of the scan, not just the download: a sign-in-gated
+    // video fails at metadata time, so changing it re-scans the URL already typed.
+  }, [url, cookiesMode, cookiesBrowser, cookiesFile]);
 
   // Clipboard URL suggestion — probes when the URL field becomes empty
   useEffect(() => {
@@ -582,10 +603,12 @@ export default function App() {
   const handleScanInfo = async (scanUrl) => {
     setError('');
     setPlaylist(null);
+    setAuthNotice('');
     setIsLoadingInfo(true);
     if (window.pywebview?.api) {
       try {
-        const info = await window.pywebview.api.get_video_info(scanUrl);
+        const info = await window.pywebview.api.get_video_info(scanUrl, { cookies: cookieOptions() });
+        if (info.cookie_warning) setAuthNotice(info.cookie_warning);
         if (info.success) {
           setVideoInfo(info);
           setSelectedFormat(info.formats?.[0]?.id ?? 'bestvideo+bestaudio/best');
@@ -638,10 +661,12 @@ export default function App() {
   const handleScanPlaylist = async (scanUrl) => {
     setError('');
     setVideoInfo(null);
+    setAuthNotice('');
     setIsLoadingPlaylist(true);
     if (window.pywebview?.api) {
       try {
-        const res = await window.pywebview.api.get_playlist_info(scanUrl);
+        const res = await window.pywebview.api.get_playlist_info(scanUrl, { cookies: cookieOptions() });
+        if (res.cookie_warning) setAuthNotice(res.cookie_warning);
         if (res.success) {
           setPlaylist({
             title: res.title,
@@ -679,16 +704,26 @@ export default function App() {
 
   // ---- Option assembly --------------------------------------------------
 
-  const currentOptions = () => ({
-    codec: videoCodec,
-    subtitles: subEnabled ? { enabled: true, lang: subLang || 'en', format: subFormat, embed: subEmbed } : null,
-    clip: (clipStart || clipEnd) ? { start: clipStart, end: clipEnd } : null,
-    filename_template: filenameTemplate || '%(title)s.%(ext)s',
-    cookies: cookiesMode === 'browser'
+  // The authentication choice, in the shape the backend expects. Shared by scans
+  // and downloads so a URL is resolved with exactly the sign-in it'll be fetched with.
+  const cookieOptions = () =>
+    cookiesMode === 'browser'
       ? { type: 'browser', browser: cookiesBrowser }
       : cookiesMode === 'file' && cookiesFile
         ? { type: 'file', file: cookiesFile }
-        : null,
+        : null;
+
+  // Settings that apply to every transmission, playlist entries included.
+  const baseOptions = () => ({
+    codec: videoCodec,
+    filename_template: filenameTemplate || '%(title)s.%(ext)s',
+    cookies: cookieOptions(),
+  });
+
+  const currentOptions = () => ({
+    ...baseOptions(),
+    subtitles: subEnabled ? { enabled: true, lang: subLang || 'en', format: subFormat, embed: subEmbed } : null,
+    clip: (clipStart || clipEnd) ? { start: clipStart, end: clipEnd } : null,
   });
 
   const formatNoteFor = (id, list) =>
@@ -832,6 +867,9 @@ export default function App() {
   const addPlaylistSelectionToQueue = () => {
     if (!playlist) return;
     const note = formatNoteFor(playlistQuality, PLAYLIST_QUALITY);
+    // Entries inherit the deck-level settings — without this they'd download
+    // signed out, ignoring the authentication the playlist itself needed to list.
+    const entryOptions = baseOptions();
     const items = playlist.entries
       .filter((e) => e.selected)
       .map((e) => ({
@@ -843,7 +881,7 @@ export default function App() {
         duration: e.duration,
         format: playlistQuality,
         formatNote: note,
-        options: {},
+        options: entryOptions,
         status: 'queued',
       }));
     if (!items.length) return;
@@ -1083,7 +1121,7 @@ export default function App() {
           aria-expanded={optionsOpen}
         >
           <span>TRANSMISSION OPTIONS{
-            (subEnabled || clipStart || clipEnd || cookiesMode !== 'none' || filenameTemplate !== '%(title)s.%(ext)s')
+            (subEnabled || clipStart || clipEnd || filenameTemplate !== '%(title)s.%(ext)s')
               ? ' • ARMED' : ''
           }</span>
           <span className="chevron">▾</span>
@@ -1162,73 +1200,112 @@ export default function App() {
                 <span className="filename-preview-name">{resolveTemplate(filenameTemplate, fileMeta)}</span>
               </div>
             </div>
-
-            <div className="opt-block">
-              <div className="opt-mini-label-row">
-                <span className="opt-mini-label">AUTHENTICATION</span>
-                <button type="button" className="help-badge" aria-label="What is authentication"
-                  onClick={() => setActiveHelp('auth')}>
-                  <span className="help-icon">?</span>
-                </button>
-              </div>
-              <label className="tactile-checkbox">
-                <input type="checkbox" checked={cookiesMode === 'browser'}
-                  onChange={(e) => setCookiesMode(e.target.checked ? 'browser' : 'none')} />
-                <span className="checkbox-box"></span>
-                <span className="checkbox-text">USE BROWSER COOKIES</span>
-              </label>
-              {cookiesMode === 'browser' && (
-                <div style={{ paddingLeft: '24px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <select className="select-dropdown compact" value={cookiesBrowser}
-                    onChange={(e) => {
-                      setCookiesBrowser(e.target.value);
-                      if (window.pywebview?.api) window.pywebview.api.save_setting('cookies_browser', e.target.value);
-                    }}>
-                    {COOKIE_BROWSERS.map((b) => (
-                      <option key={b} value={b}>{b.charAt(0).toUpperCase() + b.slice(1)}</option>
-                    ))}
-                  </select>
-                  <span className="cookies-inline-hint">
-                    Close the browser before downloading — some browsers lock the cookie store while open.
-                  </span>
-                </div>
-              )}
-              <label className="tactile-checkbox" style={{ marginTop: cookiesMode === 'browser' ? 6 : 0 }}>
-                <input type="checkbox" checked={cookiesMode === 'file'}
-                  onChange={(e) => setCookiesMode(e.target.checked ? 'file' : 'none')} />
-                <span className="checkbox-box"></span>
-                <span className="checkbox-text">USE COOKIES FILE</span>
-              </label>
-              {cookiesMode === 'file' && (
-                <div style={{ paddingLeft: '24px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                  <div className="directory-row">
-                    <button className="browse-btn" onClick={async () => {
-                      if (!window.pywebview?.api) return;
-                      try {
-                        const path = await window.pywebview.api.select_cookie_file();
-                        if (path) { setCookiesFile(path); window.pywebview.api.save_setting('cookies_file', path); }
-                      } catch (err) { console.error('Cookie file picker failed:', err); }
-                    }}>BROWSE</button>
-                    <input type="text" className="input-bar" style={{ fontSize: '0.75rem' }}
-                      placeholder="Path to cookies.txt (Netscape format)..."
-                      value={cookiesFile}
-                      onChange={(e) => {
-                        setCookiesFile(e.target.value);
-                        if (window.pywebview?.api && e.target.value)
-                          window.pywebview.api.save_setting('cookies_file', e.target.value);
-                      }} />
-                  </div>
-                  <span className="cookies-inline-hint">
-                    Netscape-format cookies.txt — export via browser extension, works without closing your browser.
-                  </span>
-                </div>
-              )}
-            </div>
           </div>
         )}
       </div>
     );
   };
+
+  // ---- Authentication ---------------------------------------------------
+
+  // Persisted as a machine-level preference, not a per-video one: the whole point
+  // is that it's already armed when a sign-in-gated link gets pasted.
+  const applyCookiesMode = (mode) => {
+    setCookiesMode(mode);
+    setAuthNotice('');
+    if (window.pywebview?.api) window.pywebview.api.save_setting('cookies_mode', mode);
+  };
+
+  const applyCookiesBrowser = (value) => {
+    setCookiesBrowser(value);
+    setAuthNotice('');
+    if (window.pywebview?.api) window.pywebview.api.save_setting('cookies_browser', value);
+  };
+
+  // Which browser the 'auto' choice resolves to, per the backend's probe.
+  const detected = detectedBrowsers || [];
+  const probed = detectedBrowsers !== null;
+  const activeBrowser = cookiesBrowser === 'auto' ? detected[0] : cookiesBrowser;
+
+  const browserHint = () => {
+    if (probed && !activeBrowser)
+      return 'No browser cookie store found on this machine — transmissions will run signed out.';
+    if (probed && !detected.includes(activeBrowser))
+      return `No ${browserLabel(activeBrowser)} cookie store found here — Kinescope falls back to signed out if it can't read one.`;
+    return `Reading your sign-in from ${browserLabel(activeBrowser) || 'your browser'}. Close it first — some browsers lock the cookie store while open; Kinescope continues signed out if it can't be read.`;
+  };
+
+  // Lives outside TRANSMISSION OPTIONS on purpose: those only render once a scan
+  // resolves, and sign-in-gated videos fail at the scan itself — so this has to be
+  // armable before a link is ever pasted.
+  const renderAuthBlock = () => (
+    <div className="input-group">
+      <div className="input-label-row">
+        <label className="input-label">AUTHENTICATION</label>
+        <button type="button" className="help-badge" aria-label="What is authentication"
+          onClick={() => setActiveHelp('auth')}>
+          <span className="help-icon">?</span>
+        </button>
+      </div>
+      <label className="tactile-checkbox">
+        <input type="checkbox" checked={cookiesMode === 'browser'}
+          onChange={(e) => applyCookiesMode(e.target.checked ? 'browser' : 'none')} />
+        <span className="checkbox-box"></span>
+        <span className="checkbox-text">USE BROWSER COOKIES</span>
+      </label>
+      {cookiesMode === 'browser' && (
+        <div style={{ paddingLeft: '24px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <select className="select-dropdown compact" value={cookiesBrowser}
+            onChange={(e) => applyCookiesBrowser(e.target.value)}>
+            <option value="auto">
+              Auto-detect{probed && detected.length ? ` — ${browserLabel(detected[0])}` : ''}
+            </option>
+            {detected.length > 0 && (
+              <optgroup label="FOUND ON THIS MACHINE">
+                {detected.map((b) => <option key={b} value={b}>{browserLabel(b)}</option>)}
+              </optgroup>
+            )}
+            <optgroup label={detected.length > 0 ? 'OTHER' : 'BROWSERS'}>
+              {COOKIE_BROWSERS.filter((b) => !detected.includes(b)).map((b) => (
+                <option key={b} value={b}>{browserLabel(b)}</option>
+              ))}
+            </optgroup>
+          </select>
+          <span className="cookies-inline-hint">{browserHint()}</span>
+        </div>
+      )}
+      <label className="tactile-checkbox" style={{ marginTop: cookiesMode === 'browser' ? 6 : 0 }}>
+        <input type="checkbox" checked={cookiesMode === 'file'}
+          onChange={(e) => applyCookiesMode(e.target.checked ? 'file' : 'none')} />
+        <span className="checkbox-box"></span>
+        <span className="checkbox-text">USE COOKIES FILE</span>
+      </label>
+      {cookiesMode === 'file' && (
+        <div style={{ paddingLeft: '24px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <div className="directory-row">
+            <button className="browse-btn" onClick={async () => {
+              if (!window.pywebview?.api) return;
+              try {
+                const path = await window.pywebview.api.select_cookie_file();
+                if (path) { setCookiesFile(path); window.pywebview.api.save_setting('cookies_file', path); }
+              } catch (err) { console.error('Cookie file picker failed:', err); }
+            }}>BROWSE</button>
+            <input type="text" className="input-bar" style={{ fontSize: '0.75rem' }}
+              placeholder="Path to cookies.txt (Netscape format)..."
+              value={cookiesFile}
+              onChange={(e) => {
+                setCookiesFile(e.target.value);
+                if (window.pywebview?.api && e.target.value)
+                  window.pywebview.api.save_setting('cookies_file', e.target.value);
+              }} />
+          </div>
+          <span className="cookies-inline-hint">
+            Netscape-format cookies.txt — export via browser extension, works without closing your browser.
+          </span>
+        </div>
+      )}
+    </div>
+  );
 
   // FILE MANIFEST / AUTHENTICATION overlay — a large defocusing panel (the deck's
   // "inventory") that shows real, plain-language examples instead of raw tokens.
@@ -1358,7 +1435,9 @@ export default function App() {
               <p className="help-overlay-intro">
                 Some videos only play when you're logged in — age-restricted clips,
                 members-only posts, private uploads. Authentication lets Kinescope
-                download those using your existing sign-in. Pick whichever is easier:
+                download those using your existing sign-in, and it's applied when a
+                link is scanned as well as when it's downloaded. It's on by default;
+                if the sign-in can't be read, Kinescope just carries on signed out.
               </p>
               <div className="auth-explainer">
                 <div className="auth-card">
@@ -1366,7 +1445,8 @@ export default function App() {
                   <p className="auth-card-line">
                     <strong>Use this when</strong> you're already signed in to the site
                     in a browser on this computer. Kinescope borrows that sign-in
-                    automatically — nothing to export.
+                    automatically — nothing to export. Leave it on <em>Auto-detect</em>{' '}
+                    and it picks up whichever browser it finds installed.
                   </p>
                   <p className="auth-card-note">
                     Close the browser first — some browsers lock their cookies while open.
@@ -1749,6 +1829,16 @@ export default function App() {
               </div>
             </div>
           )}
+          {authNotice && (
+            <div className="deck-banner warning">
+              <div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.6rem', fontWeight: 700, letterSpacing: '0.1em', marginBottom: 4 }}>
+                  SIGNED-OUT FALLBACK
+                </div>
+                <div style={{ fontSize: '0.65rem', lineHeight: 1.5 }}>{authNotice}</div>
+              </div>
+            </div>
+          )}
           <div className="input-group">
             <div className="input-label-row">
               <label className="input-label">BROADCAST SOURCE URL</label>
@@ -1794,6 +1884,8 @@ export default function App() {
             )}
             <span className="input-hint">YouTube, Vimeo, TikTok, Twitch, Soundcloud, and 1000+ other sources via yt-dlp.</span>
           </div>
+
+          {renderAuthBlock()}
 
           <div className="input-group">
             <label className="input-label">DESTINATION DIRECTORY</label>
