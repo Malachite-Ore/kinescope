@@ -4,7 +4,11 @@ on:
   push:
     branches: [ main, master ]
     tags:
+      # Both spellings, because a release tagged 1.2.4 instead of v1.2.4 silently
+      # builds nothing at all: no run starts, so there is no red X to notice —
+      # just a release with no binaries attached.
       - 'v*'
+      - '[0-9]*'
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
@@ -115,7 +119,7 @@ jobs:
           path: dist/Kinescope.app.zip
 
       - name: Release Assets (Windows)
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.os == 'windows-latest'
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'windows-latest'
         uses: softprops/action-gh-release@v3
         with:
           files: dist/Kinescope.exe
@@ -123,7 +127,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Release Assets (macOS)
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.os == 'macos-latest'
+        if: startsWith(github.ref, 'refs/tags/') && matrix.os == 'macos-latest'
         uses: softprops/action-gh-release@v3
         with:
           files: dist/Kinescope.app.zip
