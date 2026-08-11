@@ -1,11 +1,49 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
+# Dependabot opens a PR when a dependency has a newer version, so updates arrive
+# as reviewable changes instead of something to remember to check.
+# Docs: https://docs.github.com/code-security/dependabot
 version: 2
+
 updates:
-  - package-ecosystem: "" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  # Python — the one that matters most here. yt-dlp ships fixes constantly and a
+  # stale copy means broken extractors, not just missed features.
+  #
+  # requirements.txt uses `yt-dlp>=X`, which a new release technically already
+  # satisfies, so by default Dependabot would see nothing to do. `increase` makes
+  # it raise the floor on every release: builds still resolve to the newest
+  # version, and a PR shows up to tell you a new one exists.
+  - package-ecosystem: "pip"
+    directory: "/backend"
     schedule:
-      interval: "weekly"  
+      interval: "weekly"
+      day: "monday"
+    versioning-strategy: increase
+    commit-message:
+      prefix: "deps"
+
+  # Frontend — React/Vite. Grouped so a quiet week is one PR, not six.
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps"
+    groups:
+      frontend:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors stay ungrouped: React 20 or Vite 8 deserves its own PR and its own
+    # look at the changelog.
+
+  # The actions used by the build workflow. These run with repository
+  # credentials, so keeping them current is a security concern, not housekeeping.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

@@ -1,0 +1,50 @@
+# CodeQL scans the code for security bugs (injection, unsafe deserialization,
+# path traversal, and similar) and reports them under the repository's Security
+# tab. Free for public repositories.
+#
+# This is CodeQL's "advanced setup" — the scan lives here as a file you can see
+# and edit. Because it exists, GitHub's one-click "default setup" in
+# Settings → Code security is unavailable; use one or the other, not both.
+name: CodeQL
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Mondays 07:00 UTC. The weekly run matters: it re-scans unchanged code
+    # against rules published since the last commit, so a quiet repo still
+    # surfaces newly-discovered classes of bug.
+    - cron: '0 7 * * 1'
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write  # to file findings in the Security tab
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ javascript-typescript, python ]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Both languages are interpreted, so there is nothing to compile first.
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
