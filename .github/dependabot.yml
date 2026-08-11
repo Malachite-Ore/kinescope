@@ -29,10 +29,18 @@ updates:
     commit-message:
       prefix: "deps"
     groups:
+      # Vite and its plugins gate each other on peer ranges: plugin-react 6
+      # requires vite >=7, vite 8 requires plugin-react >=5. Proposed as separate
+      # PRs they each fail `npm ci` with ERESOLVE and neither can ever merge, so
+      # this group takes majors too and moves them as a set.
+      # First matching group wins, so this must stay above the catch-all below.
+      vite:
+        patterns: ["vite", "@vitejs/*"]
+        update-types: ["minor", "patch", "major"]
       frontend:
         patterns: ["*"]
         update-types: ["minor", "patch"]
-    # Majors stay ungrouped: React 20 or Vite 8 deserves its own PR and its own
+    # Other majors stay ungrouped — React 20 deserves its own PR and its own
     # look at the changelog.
 
   # The actions used by the build workflow. These run with repository
