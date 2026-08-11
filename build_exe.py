@@ -6,6 +6,48 @@ import shutil
 def log(msg):
     print(f"[KINESCOPE COMPILER] {msg}")
 
+# The packaged app writes these next to its own executable, so they live inside
+# dist/ and would be destroyed when it's cleared for a rebuild. history.json is
+# a user's entire download log; settings.json holds their download directory,
+# ffmpeg path, and cookie preferences. Neither is reproducible.
+USER_DATA_FILES = ('settings.json', 'history.json')
+
+def read_user_data(dist_dir):
+    """Reads any user data sitting in dist/ into memory before it's cleared."""
+    saved = {}
+    for name in USER_DATA_FILES:
+        path = os.path.join(dist_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'rb') as f:
+                saved[name] = f.read()
+        except Exception as e:
+            log(f"Warning: could not read {name} to preserve it: {e}")
+    return saved
+
+def restore_user_data(dist_dir, saved):
+    """Writes preserved user data back beside the freshly built executable.
+
+    Called from a finally block, so a failed compile doesn't cost the user their
+    history either. PyInstaller never emits these names itself, so there is
+    nothing here to overwrite.
+    """
+    if not saved:
+        return
+    try:
+        os.makedirs(dist_dir, exist_ok=True)
+    except Exception as e:
+        log(f"Warning: could not recreate dist/ to restore user data: {e}")
+        return
+    for name, blob in saved.items():
+        try:
+            with open(os.path.join(dist_dir, name), 'wb') as f:
+                f.write(blob)
+            log(f"Restored {name} alongside the new build.")
+        except Exception as e:
+            log(f"Warning: could not restore {name}: {e}")
+
 def main():
     root_dir = os.path.dirname(os.path.abspath(__file__))
     
@@ -64,7 +106,12 @@ img.save(r"{icon_path}", format="ICNS")
     subprocess.run(f"{npm_cmd} run build", cwd=frontend_dir, shell=True, check=True)
     log("React assets compiled successfully.")
 
-    # 5. Clean up old build outputs
+    # 5. Clean up old build outputs, rescuing user data from dist/ first
+    dist_dir = os.path.join(root_dir, 'dist')
+    preserved = read_user_data(dist_dir)
+    if preserved:
+        log(f"Preserving {', '.join(sorted(preserved))} across the rebuild...")
+
     for folder in ['build', 'dist']:
         path = os.path.join(root_dir, folder)
         if os.path.exists(path):
@@ -118,13 +165,16 @@ img.save(r"{icon_path}", format="ICNS")
     cmd.append(os.path.join(root_dir, "backend", "main.py"))
     
     log(f"Executing: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        restore_user_data(dist_dir, preserved)
+
     # 7. Report compilation result
     if sys.platform == "win32":
-        compiled_path = os.path.join(root_dir, "dist", "Kinescope.exe")
+        compiled_path = os.path.join(dist_dir, "Kinescope.exe")
     else:
-        compiled_path = os.path.join(root_dir, "dist", "Kinescope.app")
+        compiled_path = os.path.join(dist_dir, "Kinescope.app")
         
     if os.path.exists(compiled_path):
         log("====================================================")
