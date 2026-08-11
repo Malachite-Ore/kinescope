@@ -52,7 +52,14 @@ class Api:
         try:
             path = self._get_settings_path()
             if not os.path.exists(path):
-                return {'ffmpeg_path': None, 'download_dir': None}
+                return {
+                    'ffmpeg_path': None,
+                    'download_dir': None,
+                    'filename_template': '',
+                    'cookies_browser': '',
+                    'cookies_file': '',
+                    'video_codec': '',
+                }
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             ffmpeg_path = data.get('ffmpeg_path')
@@ -70,7 +77,14 @@ class Api:
                 'video_codec': data.get('video_codec', ''),
             }
         except Exception:
-            return {'ffmpeg_path': None, 'download_dir': None}
+            return {
+                'ffmpeg_path': None,
+                'download_dir': None,
+                'filename_template': '',
+                'cookies_browser': '',
+                'cookies_file': '',
+                'video_codec': '',
+            }
 
     def save_setting(self, key, value):
         """Persists a single key to settings.json."""
@@ -275,15 +289,59 @@ class Api:
         """Returns the current clipboard text (used for URL ghost-text suggestion)."""
         try:
             if sys.platform == 'win32':
-                text = subprocess.check_output(
-                    ['powershell', '-NoProfile', '-Command', 'Get-Clipboard'],
-                    text=True, timeout=2
-                ).strip()
+                # Fast, zero-subprocess ctypes method for Windows
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    
+                    CF_UNICODETEXT = 13
+                    user32 = ctypes.windll.user32
+                    kernel32 = ctypes.windll.kernel32
+                    
+                    # Define argtypes and restypes for safety
+                    user32.OpenClipboard.argtypes = [wintypes.HWND]
+                    user32.OpenClipboard.restype = wintypes.BOOL
+                    user32.CloseClipboard.argtypes = []
+                    user32.CloseClipboard.restype = wintypes.BOOL
+                    user32.GetClipboardData.argtypes = [wintypes.UINT]
+                    user32.GetClipboardData.restype = wintypes.HANDLE
+                    
+                    kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+                    kernel32.GlobalLock.restype = wintypes.LPVOID
+                    kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+                    kernel32.GlobalUnlock.restype = wintypes.BOOL
+                    
+                    text = ""
+                    if user32.OpenClipboard(None):
+                        try:
+                            handle = user32.GetClipboardData(CF_UNICODETEXT)
+                            if handle:
+                                ptr = kernel32.GlobalLock(handle)
+                                if ptr:
+                                    try:
+                                        text = ctypes.wstring_at(ptr)
+                                    finally:
+                                        kernel32.GlobalUnlock(handle)
+                        finally:
+                            user32.CloseClipboard()
+                    return {'text': text.strip()}
+                except Exception:
+                    # Fallback to powershell method, but suppress window completely
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = subprocess.SW_HIDE
+                    creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0x08000000
+                    text = subprocess.check_output(
+                        ['powershell', '-NoProfile', '-Command', 'Get-Clipboard'],
+                        text=True, timeout=2, startupinfo=startupinfo,
+                        creationflags=creationflags
+                    ).strip()
+                    return {'text': text}
             elif sys.platform == 'darwin':
                 text = subprocess.check_output(['pbpaste'], text=True, timeout=2).strip()
+                return {'text': text}
             else:
                 return {'text': ''}
-            return {'text': text}
         except Exception:
             return {'text': ''}
 
@@ -334,11 +392,13 @@ class Api:
         try:
             if not os.path.isfile(path):
                 return {'valid': False, 'error': 'File does not exist.'}
+            creationflags = subprocess.CREATE_NO_WINDOW if (sys.platform == 'win32' and hasattr(subprocess, 'CREATE_NO_WINDOW')) else 0
             result = subprocess.run(
                 [path, '-version'],
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=5,
+                creationflags=creationflags
             )
             output = (result.stdout + result.stderr).lower()
             if result.returncode == 0 and 'ffmpeg' in output:
