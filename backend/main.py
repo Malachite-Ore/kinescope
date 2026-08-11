@@ -12,6 +12,67 @@ import webview
 from webview import FileDialog
 import yt_dlp
 
+try:
+    # Raised (and chained onto the surfaced DownloadError) whenever yt-dlp cannot
+    # read a cookie store. Lets us tell "your browser is locked" apart from
+    # "the site rejected us", which look identical in the error text.
+    from yt_dlp.cookies import CookieLoadError
+except ImportError:  # yt-dlp older than 2024.12
+    CookieLoadError = None
+
+
+def _browser_cookie_roots():
+    """Maps each supported browser to the profile folders that hold its cookie
+    store. Insertion order doubles as the auto-detect preference order."""
+    home = os.path.expanduser('~')
+
+    if sys.platform == 'win32':
+        local = os.environ.get('LOCALAPPDATA') or os.path.join(home, 'AppData', 'Local')
+        roaming = os.environ.get('APPDATA') or os.path.join(home, 'AppData', 'Roaming')
+        return {
+            'chrome':   [os.path.join(local, 'Google', 'Chrome', 'User Data')],
+            'edge':     [os.path.join(local, 'Microsoft', 'Edge', 'User Data')],
+            'firefox':  [os.path.join(roaming, 'Mozilla', 'Firefox')],
+            'brave':    [os.path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data')],
+            'vivaldi':  [os.path.join(local, 'Vivaldi', 'User Data')],
+            'opera':    [os.path.join(roaming, 'Opera Software', 'Opera Stable')],
+            'chromium': [os.path.join(local, 'Chromium', 'User Data')],
+        }
+
+    if sys.platform == 'darwin':
+        app = os.path.join(home, 'Library', 'Application Support')
+        return {
+            'chrome':   [os.path.join(app, 'Google', 'Chrome')],
+            'safari':   [os.path.join(home, 'Library', 'Cookies'),
+                         os.path.join(home, 'Library', 'Containers', 'com.apple.Safari',
+                                      'Data', 'Library', 'Cookies')],
+            'firefox':  [os.path.join(app, 'Firefox')],
+            'edge':     [os.path.join(app, 'Microsoft Edge')],
+            'brave':    [os.path.join(app, 'BraveSoftware', 'Brave-Browser')],
+            'vivaldi':  [os.path.join(app, 'Vivaldi')],
+            'opera':    [os.path.join(app, 'com.operasoftware.Opera')],
+            'chromium': [os.path.join(app, 'Chromium')],
+        }
+
+    config = os.environ.get('XDG_CONFIG_HOME') or os.path.join(home, '.config')
+    return {
+        'chrome':   [os.path.join(config, 'google-chrome')],
+        'firefox':  [os.path.join(home, '.mozilla', 'firefox'),
+                     os.path.join(home, 'snap', 'firefox', 'common', '.mozilla', 'firefox')],
+        'edge':     [os.path.join(config, 'microsoft-edge')],
+        'brave':    [os.path.join(config, 'BraveSoftware', 'Brave-Browser')],
+        'vivaldi':  [os.path.join(config, 'vivaldi')],
+        'opera':    [os.path.join(config, 'opera')],
+        'chromium': [os.path.join(config, 'chromium'),
+                     os.path.join(home, 'snap', 'chromium', 'common', 'chromium')],
+    }
+
+
+def _clean_error(exc):
+    """Strips yt-dlp's console prefix so a message reads well in the UI."""
+    return str(exc).replace('ERROR: ', '').strip()
+
+
 class Api:
     def __init__(self):
         self._window = None
@@ -47,19 +108,31 @@ class Api:
         """Returns path to settings.json, next to the exe or at project root."""
         return os.path.join(os.path.dirname(self._get_bin_dir()), 'settings.json')
 
+    def _default_settings(self):
+        """Shape returned by load_settings, with out-of-the-box defaults.
+
+        Authentication defaults to ON with auto-detected browser cookies: most
+        sources now gate ordinary videos behind a sign-in check, and a missing or
+        unreadable cookie store degrades to a signed-out attempt rather than an
+        error (see _run_ydl), so leaving it armed costs nothing.
+        """
+        return {
+            'ffmpeg_path': None,
+            'download_dir': None,
+            'filename_template': '',
+            'cookies_mode': 'browser',
+            'cookies_browser': 'auto',
+            'cookies_file': '',
+            'video_codec': '',
+        }
+
     def load_settings(self):
         """Reads settings.json and populates internal ffmpeg state. Never raises."""
+        settings = self._default_settings()
         try:
             path = self._get_settings_path()
             if not os.path.exists(path):
-                return {
-                    'ffmpeg_path': None,
-                    'download_dir': None,
-                    'filename_template': '',
-                    'cookies_browser': '',
-                    'cookies_file': '',
-                    'video_codec': '',
-                }
+                return settings
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             ffmpeg_path = data.get('ffmpeg_path')
@@ -68,27 +141,18 @@ class Api:
                 self._custom_ffmpeg_dir = os.path.dirname(ffmpeg_path)
             else:
                 ffmpeg_path = None
-            return {
-                'ffmpeg_path': ffmpeg_path,
-                'download_dir': data.get('download_dir'),
-                'filename_template': data.get('filename_template', ''),
-                'cookies_browser': data.get('cookies_browser', ''),
-                'cookies_file': data.get('cookies_file', ''),
-                'video_codec': data.get('video_codec', ''),
-            }
+            for key in settings:
+                if key in data and data[key] is not None:
+                    settings[key] = data[key]
+            settings['ffmpeg_path'] = ffmpeg_path
+            return settings
         except Exception:
-            return {
-                'ffmpeg_path': None,
-                'download_dir': None,
-                'filename_template': '',
-                'cookies_browser': '',
-                'cookies_file': '',
-                'video_codec': '',
-            }
+            return self._default_settings()
 
     def save_setting(self, key, value):
         """Persists a single key to settings.json."""
-        valid_keys = {'ffmpeg_path', 'download_dir', 'filename_template', 'cookies_browser', 'cookies_file', 'video_codec'}
+        valid_keys = {'ffmpeg_path', 'download_dir', 'filename_template', 'cookies_mode',
+                      'cookies_browser', 'cookies_file', 'video_codec'}
         if key not in valid_keys:
             return {'success': False, 'error': f'Unknown key: {key}'}
         try:
@@ -188,7 +252,73 @@ class Api:
             seconds = seconds * 60 + p
         return seconds
 
-    def get_playlist_info(self, url):
+    # ---- Authentication ---------------------------------------------------
+
+    def detect_browsers(self):
+        """Lists browsers that actually have a cookie store on this machine,
+        most-preferred first, so the UI can arm authentication without the user
+        having to know which browser to name."""
+        found = [name for name, roots in _browser_cookie_roots().items()
+                 if any(os.path.exists(p) for p in roots)]
+        return {'browsers': found, 'default': found[0] if found else ''}
+
+    def _cookie_opts(self, cookies):
+        """Maps the UI's authentication choice onto yt-dlp options.
+        An empty dict means "run signed out"."""
+        if not cookies:
+            return {}
+        kind = cookies.get('type')
+        if kind == 'browser':
+            browser = (cookies.get('browser') or 'auto').lower()
+            if browser == 'auto':
+                browser = self.detect_browsers()['default']
+            if browser:
+                return {'cookiesfrombrowser': (browser, None, None, None)}
+        elif kind == 'file':
+            path = cookies.get('file') or ''
+            if path and os.path.exists(path):
+                return {'cookiefile': path}
+        return {}
+
+    @staticmethod
+    def _is_cookie_error(exc):
+        """True when the failure came from reading the cookie store rather than
+        from the site itself. yt-dlp surfaces these as a DownloadError with a
+        CookieLoadError chained behind it, so walk the chain."""
+        seen = set()
+        while exc is not None and id(exc) not in seen:
+            seen.add(id(exc))
+            if CookieLoadError is not None:
+                if isinstance(exc, CookieLoadError):
+                    return True
+            elif 'failed to load cookies' in str(exc).lower():
+                return True
+            exc = exc.__cause__ or exc.__context__
+        return False
+
+    def _run_ydl(self, base_opts, cookies, action):
+        """Runs `action(ydl)` with authentication applied, retrying once signed
+        out when the cookie store can't be read — browser not installed, profile
+        locked while it's open, or cookies the OS won't hand over.
+
+        Returns (result, warning) where warning is None on a clean run. This is
+        what lets browser cookies stay armed by default: an unreadable store
+        costs a retry, not a failed download.
+        """
+        cookie_opts = self._cookie_opts(cookies)
+        warning = None
+        if cookie_opts:
+            try:
+                with yt_dlp.YoutubeDL({**base_opts, **cookie_opts}) as ydl:
+                    return action(ydl), None
+            except Exception as e:
+                if not self._is_cookie_error(e):
+                    raise
+                warning = f"Couldn't read your sign-in cookies ({_clean_error(e)}) — continuing signed out."
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            return action(ydl), warning
+
+    def get_playlist_info(self, url, options=None):
         """Lists the entries of a playlist without resolving each video fully."""
         try:
             ydl_opts = {
@@ -197,8 +327,10 @@ class Api:
                 'extract_flat': True,
                 'nocheckcertificate': True,
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            info, cookie_warning = self._run_ydl(
+                ydl_opts, (options or {}).get('cookies'),
+                lambda ydl: ydl.extract_info(url, download=False)
+            )
 
             entries_raw = info.get('entries')
             if not entries_raw:
@@ -229,9 +361,10 @@ class Api:
                 'uploader': info.get('uploader') or info.get('channel') or 'Unknown Source',
                 'count': len(entries),
                 'entries': entries,
+                'cookie_warning': cookie_warning,
             }
         except Exception as e:
-            return {'success': False, 'is_playlist': False, 'error': str(e)}
+            return {'success': False, 'is_playlist': False, 'error': _clean_error(e)}
 
     def check_dependencies(self):
         """Checks if ffmpeg is available in any known location."""
@@ -345,6 +478,19 @@ class Api:
         except Exception:
             return {'text': ''}
 
+    @staticmethod
+    def _version_key(version):
+        """Turns a yt-dlp version ('2026.07.04', '2026.7.4.123456') into a
+        comparable tuple. PyPI and GitHub disagree on zero-padding, so comparing
+        the raw strings would call a padded build older than an unpadded one."""
+        parts = []
+        for chunk in str(version).split('.'):
+            try:
+                parts.append(int(chunk))
+            except ValueError:
+                break
+        return tuple(parts)
+
     def check_ytdlp_update(self):
         """Checks GitHub for a newer yt-dlp release than the bundled version."""
         try:
@@ -357,7 +503,10 @@ class Api:
             with urllib.request.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read())
             latest = data.get('tag_name', '').lstrip('v')
-            return {'current': current, 'latest': latest, 'up_to_date': current >= latest}
+            if not latest:
+                return {'current': current, 'latest': '', 'up_to_date': True}
+            up_to_date = self._version_key(current) >= self._version_key(latest)
+            return {'current': current, 'latest': latest, 'up_to_date': up_to_date}
         except Exception:
             return {'current': '', 'latest': '', 'up_to_date': True}
 
@@ -415,7 +564,7 @@ class Api:
         """Returns the system default Downloads folder."""
         return os.path.join(os.path.expanduser('~'), 'Downloads')
 
-    def get_video_info(self, url):
+    def get_video_info(self, url, options=None):
         """Extracts video metadata without downloading."""
         try:
             ydl_opts = {
@@ -424,96 +573,99 @@ class Api:
                 'extract_flat': False,
                 'nocheckcertificate': True
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            info, cookie_warning = self._run_ydl(
+                ydl_opts, (options or {}).get('cookies'),
+                lambda ydl: ydl.extract_info(url, download=False)
+            )
 
-                if 'entries' in info:
-                    return {
-                        'success': False,
-                        'is_playlist': True,
-                        'error': 'This URL is a playlist. Open the playlist browser to pick entries.'
-                    }
-
-                duration_secs = info.get('duration', 0)
-                minutes = duration_secs // 60
-                seconds = duration_secs % 60
-                duration_str = f"{minutes:02d}:{seconds:02d}"
-
-                # Scan streams: is there video at all, and what real heights exist?
-                raw_formats = info.get('formats', []) or []
-                has_video = False
-                available_heights = set()
-                for f in raw_formats:
-                    if f.get('vcodec') and f.get('vcodec') != 'none':
-                        has_video = True
-                        h = f.get('height')
-                        if isinstance(h, int) and h > 0:
-                            available_heights.add(h)
-
-                formats = [{'id': 'bestvideo+bestaudio/best', 'note': 'Best Quality (Default)'}]
-
-                # Quality ladder, ascending. Each rung owns the band (prev, height]; we
-                # only offer a rung when a real stream falls inside its band, so the menu
-                # mirrors exactly what the source actually serves (no phantom 144p on a
-                # video whose floor is 360p). yt-dlp picks the best stream <= the rung.
-                ladder = [
-                    (144,  'bestvideo[height<=144]+bestaudio/best',  '144p'),
-                    (240,  'bestvideo[height<=240]+bestaudio/best',  '240p'),
-                    (360,  'bestvideo[height<=360]+bestaudio/best',  '360p SD'),
-                    (480,  'bestvideo[height<=480]+bestaudio/best',  '480p SD'),
-                    (720,  'bestvideo[height<=720]+bestaudio/best',  '720p HD'),
-                    (1080, 'bestvideo[height<=1080]+bestaudio/best', '1080p FHD'),
-                    (1440, 'bestvideo[height<=1440]+bestaudio/best', '2K QHD (1440p)'),
-                    (2160, 'bestvideo[height<=2160]+bestaudio/best', '4K UHD (2160p)'),
-                    (4320, 'bestvideo[height<=4320]+bestaudio/best', '8K UHD (4320p)'),
-                ]
-
-                if available_heights:
-                    prev = 0
-                    rungs = []
-                    for h, fmt_id, note in ladder:
-                        if any(prev < ah <= h for ah in available_heights):
-                            rungs.append({'id': fmt_id, 'note': note})
-                        prev = h
-                    formats.extend(reversed(rungs))  # best -> worst, matching prior order
-                else:
-                    # Fallback for sites where heights don't resolve but video exists.
-                    # These selectors end in /best, so they degrade gracefully per-video.
-                    if has_video:
-                        formats.extend([
-                            {'id': 'bestvideo[height<=1080]+bestaudio/best', 'note': '1080p FHD'},
-                            {'id': 'bestvideo[height<=720]+bestaudio/best', 'note': '720p HD'},
-                            {'id': 'bestvideo[height<=480]+bestaudio/best', 'note': '480p SD'}
-                        ])
-
-                formats.append({'id': 'bestaudio/best', 'note': 'Audio Only (MP3)'})
-
-                # Caption tracks: manual subtitles first, then automatic captions.
-                subs_info = info.get('subtitles') or {}
-                auto_info = info.get('automatic_captions') or {}
-                subtitles = []
-                seen_langs = set()
-                for code in subs_info.keys():
-                    seen_langs.add(code)
-                    subtitles.append({'code': code, 'name': code, 'auto': False})
-                for code in auto_info.keys():
-                    if code in seen_langs:
-                        continue
-                    subtitles.append({'code': code, 'name': f'{code} (auto)', 'auto': True})
-
+            if 'entries' in info:
                 return {
-                    'success': True,
-                    'title': info.get('title', 'Unknown Title'),
-                    'uploader': info.get('uploader', 'Unknown Creator'),
-                    'duration': duration_str,
-                    'thumbnail': info.get('thumbnail', ''),
-                    'id': info.get('id', ''),
-                    'upload_date': info.get('upload_date', ''),  # yt-dlp format: YYYYMMDD
-                    'formats': formats,
-                    'subtitles': subtitles,
+                    'success': False,
+                    'is_playlist': True,
+                    'error': 'This URL is a playlist. Open the playlist browser to pick entries.'
                 }
+
+            duration_secs = info.get('duration', 0)
+            minutes = duration_secs // 60
+            seconds = duration_secs % 60
+            duration_str = f"{minutes:02d}:{seconds:02d}"
+
+            # Scan streams: is there video at all, and what real heights exist?
+            raw_formats = info.get('formats', []) or []
+            has_video = False
+            available_heights = set()
+            for f in raw_formats:
+                if f.get('vcodec') and f.get('vcodec') != 'none':
+                    has_video = True
+                    h = f.get('height')
+                    if isinstance(h, int) and h > 0:
+                        available_heights.add(h)
+
+            formats = [{'id': 'bestvideo+bestaudio/best', 'note': 'Best Quality (Default)'}]
+
+            # Quality ladder, ascending. Each rung owns the band (prev, height]; we
+            # only offer a rung when a real stream falls inside its band, so the menu
+            # mirrors exactly what the source actually serves (no phantom 144p on a
+            # video whose floor is 360p). yt-dlp picks the best stream <= the rung.
+            ladder = [
+                (144,  'bestvideo[height<=144]+bestaudio/best',  '144p'),
+                (240,  'bestvideo[height<=240]+bestaudio/best',  '240p'),
+                (360,  'bestvideo[height<=360]+bestaudio/best',  '360p SD'),
+                (480,  'bestvideo[height<=480]+bestaudio/best',  '480p SD'),
+                (720,  'bestvideo[height<=720]+bestaudio/best',  '720p HD'),
+                (1080, 'bestvideo[height<=1080]+bestaudio/best', '1080p FHD'),
+                (1440, 'bestvideo[height<=1440]+bestaudio/best', '2K QHD (1440p)'),
+                (2160, 'bestvideo[height<=2160]+bestaudio/best', '4K UHD (2160p)'),
+                (4320, 'bestvideo[height<=4320]+bestaudio/best', '8K UHD (4320p)'),
+            ]
+
+            if available_heights:
+                prev = 0
+                rungs = []
+                for h, fmt_id, note in ladder:
+                    if any(prev < ah <= h for ah in available_heights):
+                        rungs.append({'id': fmt_id, 'note': note})
+                    prev = h
+                formats.extend(reversed(rungs))  # best -> worst, matching prior order
+            else:
+                # Fallback for sites where heights don't resolve but video exists.
+                # These selectors end in /best, so they degrade gracefully per-video.
+                if has_video:
+                    formats.extend([
+                        {'id': 'bestvideo[height<=1080]+bestaudio/best', 'note': '1080p FHD'},
+                        {'id': 'bestvideo[height<=720]+bestaudio/best', 'note': '720p HD'},
+                        {'id': 'bestvideo[height<=480]+bestaudio/best', 'note': '480p SD'}
+                    ])
+
+            formats.append({'id': 'bestaudio/best', 'note': 'Audio Only (MP3)'})
+
+            # Caption tracks: manual subtitles first, then automatic captions.
+            subs_info = info.get('subtitles') or {}
+            auto_info = info.get('automatic_captions') or {}
+            subtitles = []
+            seen_langs = set()
+            for code in subs_info.keys():
+                seen_langs.add(code)
+                subtitles.append({'code': code, 'name': code, 'auto': False})
+            for code in auto_info.keys():
+                if code in seen_langs:
+                    continue
+                subtitles.append({'code': code, 'name': f'{code} (auto)', 'auto': True})
+
+            return {
+                'success': True,
+                'title': info.get('title', 'Unknown Title'),
+                'uploader': info.get('uploader', 'Unknown Creator'),
+                'duration': duration_str,
+                'thumbnail': info.get('thumbnail', ''),
+                'id': info.get('id', ''),
+                'upload_date': info.get('upload_date', ''),  # yt-dlp format: YYYYMMDD
+                'formats': formats,
+                'subtitles': subtitles,
+                'cookie_warning': cookie_warning,
+            }
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': _clean_error(e)}
 
     def start_download(self, url, download_dir, format_id, options=None, job_id=None):
         """Launches a video download in its own thread, tagged with a job_id."""
@@ -838,24 +990,20 @@ class Api:
                     )
                     ydl_opts['force_keyframes_at_cuts'] = True
 
-            # Authentication via cookies
-            cookies = options.get('cookies')
-            if cookies:
-                cookie_type = cookies.get('type')
-                if cookie_type == 'browser':
-                    browser_name = (cookies.get('browser') or 'chrome').lower()
-                    ydl_opts['cookiesfrombrowser'] = (browser_name, None, None, None)
-                elif cookie_type == 'file':
-                    cookie_path = cookies.get('file', '')
-                    if cookie_path and os.path.exists(cookie_path):
-                        ydl_opts['cookiefile'] = cookie_path
+            # Authentication via cookies — falls back to a signed-out attempt if
+            # the cookie store can't be read, so a locked browser never kills a job.
+            _, cookie_warning = self._run_ydl(
+                ydl_opts, options.get('cookies'), lambda ydl: ydl.download([url])
+            )
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            self._send_progress({'status': 'completed', 'percent': 100, 'message': 'Archival complete!'}, job_id)
+            self._send_progress({
+                'status': 'completed',
+                'percent': 100,
+                'message': 'Archival complete!',
+                'cookie_warning': cookie_warning,
+            }, job_id)
         except Exception as e:
-            self._send_progress({'status': 'error', 'message': str(e)}, job_id)
+            self._send_progress({'status': 'error', 'message': _clean_error(e)}, job_id)
         finally:
             self._active_jobs.discard(job_id)
             self._cancelled.discard(job_id)

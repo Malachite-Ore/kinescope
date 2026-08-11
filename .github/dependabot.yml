@@ -1,0 +1,57 @@
+# Dependabot opens a PR when a dependency has a newer version, so updates arrive
+# as reviewable changes instead of something to remember to check.
+# Docs: https://docs.github.com/code-security/dependabot
+version: 2
+
+updates:
+  # Python — the one that matters most here. yt-dlp ships fixes constantly and a
+  # stale copy means broken extractors, not just missed features.
+  #
+  # requirements.txt uses `yt-dlp>=X`, which a new release technically already
+  # satisfies, so by default Dependabot would see nothing to do. `increase` makes
+  # it raise the floor on every release: builds still resolve to the newest
+  # version, and a PR shows up to tell you a new one exists.
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    versioning-strategy: increase
+    commit-message:
+      prefix: "deps"
+
+  # Frontend — React/Vite. Grouped so a quiet week is one PR, not six.
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Vite and its plugins gate each other on peer ranges: plugin-react 6
+      # requires vite >=7, vite 8 requires plugin-react >=5. Proposed as separate
+      # PRs they each fail `npm ci` with ERESOLVE and neither can ever merge, so
+      # this group takes majors too and moves them as a set.
+      # First matching group wins, so this must stay above the catch-all below.
+      vite:
+        patterns: ["vite", "@vitejs/*"]
+        update-types: ["minor", "patch", "major"]
+      frontend:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Other majors stay ungrouped — React 20 deserves its own PR and its own
+    # look at the changelog.
+
+  # The actions used by the build workflow. These run with repository
+  # credentials, so keeping them current is a security concern, not housekeeping.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
