@@ -9,6 +9,7 @@ Kinescope is a minimalist, high-aesthetic desktop GUI frontend for `yt-dlp`. It 
 - **Cross-Platform Compatibility**: Fully compatible with both **Windows** (using WebView2 Edge Chromium) and **macOS** (using WebKit).
 - **Auto-Configured Dependencies**: Downloads and extracts platform-specific FFmpeg static binaries locally in a background thread upon first startup so that merging video and audio formats works out-of-the-box.
 - **Dynamic Format Selector**: Pasting a YouTube URL fetches available video and audio streams, letting you pick resolution formats dynamically.
+- **Sign-In Aware by Default**: Authentication sits on the main deck — armed before you paste a link, not buried behind a scan — and defaults to auto-detected browser cookies so age-restricted, members-only, and private videos resolve on the first try. Both the URL scan and the download use it, and an unreadable cookie store (browser locked, not installed, OS-encrypted) quietly falls back to a signed-out attempt instead of failing. A Netscape `cookies.txt` file works as an alternative.
 - **Responsive Oscilloscope**: A custom Canvas audio-wave/oscilloscope visualizer that reactively scales and pulses based on your download speed, progress, and system states.
 - **Native Folder Picker**: Seamlessly integrated, left-aligned system directory picker (`FileDialog.FOLDER`) for choosing save paths.
 - **Portable Standalone Binaries**: Compiles into a single, self-contained executable with custom application icon styling.
